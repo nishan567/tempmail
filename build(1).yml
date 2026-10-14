@@ -1,0 +1,668 @@
+name: Build APK
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+
+      - name: Write project files
+        run: |
+          mkdir -p 'app'
+          cat > 'app/build.gradle.kts' <<'__END_OF_FILE__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.tempmail"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.tempmail"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          __END_OF_FILE__
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@android:drawable/ic_dialog_email"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".BubbleService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="floating temporary email bubble" />
+                  </service>
+
+                  <service
+                      android:name=".FillService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          __END_OF_FILE__
+          mkdir -p 'app/src/main/java/com/example/tempmail'
+          cat > 'app/src/main/java/com/example/tempmail/BubbleService.kt' <<'__END_OF_FILE__'
+          package com.example.tempmail
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.util.concurrent.Executors
+          import kotlin.math.abs
+
+          class BubbleService : Service() {
+
+              private lateinit var wm: WindowManager
+              private lateinit var lp: WindowManager.LayoutParams
+              private lateinit var root: LinearLayout
+              private lateinit var bubble: TextView
+              private lateinit var panel: LinearLayout
+              private lateinit var emailView: TextView
+              private lateinit var codeView: TextView
+              private lateinit var keepBox: CheckBox
+
+              private val handler = Handler(Looper.getMainLooper())
+              private val io = Executors.newSingleThreadExecutor()
+              private val mail = MailTm()
+              private var lastCode = ""
+
+              @Volatile private var busy = false
+              @Volatile private var ready = false
+
+              private val pollTask = object : Runnable {
+                  override fun run() {
+                      pollOnce()
+                      handler.postDelayed(this, 4000)
+                  }
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  startAsForeground()
+                  buildViews()
+                  newInbox()
+                  handler.postDelayed(pollTask, 4000)
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
+                  io.shutdownNow()
+                  try { wm.removeView(root) } catch (e: Exception) {}
+                  super.onDestroy()
+              }
+
+              // ---------- foreground notification ----------
+
+              private fun startAsForeground() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("bubble", "TempMail bubble", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val pi = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(this, "bubble")
+                      .setContentTitle("TempMail bubble is running")
+                      .setSmallIcon(android.R.drawable.ic_dialog_email)
+                      .setContentIntent(pi)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              // ---------- UI ----------
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun label(size: Float, bold: Boolean): TextView {
+                  val t = TextView(this)
+                  t.textSize = size
+                  t.setTextColor(Color.parseColor("#111827"))
+                  if (bold) t.setTypeface(null, Typeface.BOLD)
+                  return t
+              }
+
+              private fun button(text: String, action: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = text
+                  b.isAllCaps = false
+                  b.setOnClickListener { action() }
+                  return b
+              }
+
+              private fun row(vararg buttons: Button): LinearLayout {
+                  val r = LinearLayout(this)
+                  r.orientation = LinearLayout.HORIZONTAL
+                  for (b in buttons) {
+                      r.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  }
+                  return r
+              }
+
+              private fun buildViews() {
+                  root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+
+                  bubble = TextView(this)
+                  bubble.text = "✉"
+                  bubble.textSize = 22f
+                  bubble.gravity = Gravity.CENTER
+                  bubble.setTextColor(Color.WHITE)
+                  val circle = GradientDrawable()
+                  circle.shape = GradientDrawable.OVAL
+                  circle.setColor(Color.parseColor("#2563EB"))
+                  bubble.background = circle
+                  root.addView(bubble, LinearLayout.LayoutParams(dp(52), dp(52)))
+
+                  panel = LinearLayout(this)
+                  panel.orientation = LinearLayout.VERTICAL
+                  panel.setPadding(dp(12), dp(12), dp(12), dp(12))
+                  val card = GradientDrawable()
+                  card.setColor(Color.WHITE)
+                  card.cornerRadius = dp(12).toFloat()
+                  card.setStroke(dp(1), Color.LTGRAY)
+                  panel.background = card
+                  panel.visibility = View.GONE
+
+                  emailView = label(15f, true)
+                  emailView.text = "Creating…"
+                  codeView = label(30f, true)
+                  codeView.setTextColor(Color.parseColor("#2563EB"))
+                  codeView.text = "—"
+
+                  keepBox = CheckBox(this)
+                  keepBox.text = "Keep the same email"
+                  keepBox.setTextColor(Color.parseColor("#111827"))
+                  keepBox.isChecked = true
+
+                  panel.addView(emailView)
+                  panel.addView(row(
+                      button("Copy email") { copyWithToast(mail.address) },
+                      button("Fill email") { fill(mail.address) }
+                  ))
+                  panel.addView(codeView)
+                  panel.addView(row(
+                      button("Copy code") { copyWithToast(lastCode) },
+                      button("Fill code") { fill(lastCode) }
+                  ))
+                  panel.addView(keepBox)
+                  panel.addView(row(
+                      button("New email") { newInbox() },
+                      button("Stop") { stopSelf() }
+                  ))
+                  root.addView(panel, LinearLayout.LayoutParams(dp(270), ViewGroup.LayoutParams.WRAP_CONTENT))
+
+                  lp = WindowManager.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT,
+                      ViewGroup.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.x = dp(8)
+                  lp.y = dp(200)
+
+                  // Drag the bubble; a tap (no drag) opens or closes the panel
+                  bubble.setOnTouchListener(object : View.OnTouchListener {
+                      var startX = 0
+                      var startY = 0
+                      var touchX = 0f
+                      var touchY = 0f
+                      var moved = false
+
+                      override fun onTouch(v: View, e: MotionEvent): Boolean {
+                          when (e.action) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  startX = lp.x; startY = lp.y
+                                  touchX = e.rawX; touchY = e.rawY
+                                  moved = false
+                              }
+                              MotionEvent.ACTION_MOVE -> {
+                                  val dx = (e.rawX - touchX).toInt()
+                                  val dy = (e.rawY - touchY).toInt()
+                                  if (abs(dx) > 10 || abs(dy) > 10) moved = true
+                                  if (moved) {
+                                      lp.x = startX + dx
+                                      lp.y = startY + dy
+                                      wm.updateViewLayout(root, lp)
+                                  }
+                              }
+                              MotionEvent.ACTION_UP -> if (!moved) togglePanel()
+                          }
+                          return true
+                      }
+                  })
+
+                  wm.addView(root, lp)
+              }
+
+              private fun togglePanel() {
+                  if (panel.visibility == View.VISIBLE) {
+                      panel.visibility = View.GONE
+                  } else {
+                      if (!keepBox.isChecked) newInbox() // option off = fresh email each time you open it
+                      panel.visibility = View.VISIBLE
+                  }
+              }
+
+              // ---------- mail ----------
+
+              private fun newInbox() {
+                  emailView.text = "Creating…"
+                  codeView.text = "—"
+                  lastCode = ""
+                  ready = false
+                  io.execute {
+                      try {
+                          mail.createInbox()
+                          handler.post {
+                              emailView.text = mail.address
+                              ready = true
+                              copy(mail.address)
+                          }
+                      } catch (e: Exception) {
+                          val detail = (e.message ?: e.javaClass.simpleName).take(140)
+                          handler.post {
+                              emailView.text = "New email failed: $detail"
+                              Toast.makeText(this, "Could not create inbox: $detail", Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }
+              }
+
+              private fun pollOnce() {
+                  if (busy || !ready) return
+                  busy = true
+                  io.execute {
+                      try {
+                          val code = mail.newCode()
+                          if (code != null) handler.post { onCode(code) }
+                      } catch (e: Exception) {
+                          val detail = (e.message ?: e.javaClass.simpleName).take(120)
+                          handler.post {
+                              Toast.makeText(this@BubbleService, "Inbox check failed: $detail", Toast.LENGTH_LONG).show()
+                          }
+                      }
+                      busy = false
+                  }
+              }
+
+              private fun onCode(code: String) {
+                  lastCode = code
+                  codeView.text = code
+                  val copied = copy(code)
+                  panel.visibility = View.VISIBLE
+                  vibrate()
+                  Toast.makeText(this, if (copied) "Code $code copied" else "Code $code received", Toast.LENGTH_LONG).show()
+              }
+
+              // ---------- helpers ----------
+
+              private fun copy(text: String): Boolean {
+                  if (text.isBlank() || text == "—") return false
+                  return try {
+                      val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                      cm.setPrimaryClip(ClipData.newPlainText("tempmail", text))
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              private fun copyWithToast(text: String) {
+                  val ok = copy(text)
+                  Toast.makeText(this, if (ok) "Copied" else "Nothing to copy yet", Toast.LENGTH_SHORT).show()
+              }
+
+              /** Types into the focused field of the app underneath (needs the optional auto-fill step). */
+              private fun fill(text: String) {
+                  if (text.isBlank() || text == "—") return
+                  if (FillService.fill(text)) {
+                      Toast.makeText(this, "Filled", Toast.LENGTH_SHORT).show()
+                  } else {
+                      copy(text)
+                      Toast.makeText(this, "Copied – tap the field and paste (or turn on auto-fill)", Toast.LENGTH_LONG).show()
+                  }
+              }
+
+              private fun vibrate() {
+                  try {
+                      val v = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                      v.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE))
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p 'app/src/main/java/com/example/tempmail'
+          cat > 'app/src/main/java/com/example/tempmail/FillService.kt' <<'__END_OF_FILE__'
+          package com.example.tempmail
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          /** Optional: types text into the field that currently has focus in another app or browser. */
+          class FillService : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: FillService? = null
+
+                  fun fill(text: String): Boolean {
+                      val service = instance ?: return false
+                      val root = service.rootInActiveWindow ?: return false
+                      val node = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+                      val args = Bundle()
+                      args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                      return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                  }
+              }
+
+              override fun onServiceConnected() {
+                  instance = this
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+          }
+          __END_OF_FILE__
+          mkdir -p 'app/src/main/java/com/example/tempmail'
+          cat > 'app/src/main/java/com/example/tempmail/MailTm.kt' <<'__END_OF_FILE__'
+          package com.example.tempmail
+
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          /** Minimal mail.tm client (no external libraries). Call from a background thread. */
+          class MailTm {
+              private val base = "https://api.mail.tm"
+              private var token = ""
+              private val seen = HashSet<String>()
+              var address = ""
+                  private set
+
+              private fun request(method: String, path: String, body: JSONObject? = null, auth: Boolean = false): String {
+                  val conn = URL(base + path).openConnection() as HttpURLConnection
+                  try {
+                      conn.requestMethod = method
+                      conn.connectTimeout = 15000
+                      conn.readTimeout = 15000
+                      conn.setRequestProperty("Accept", "application/json")
+                      if (auth) conn.setRequestProperty("Authorization", "Bearer $token")
+                      if (body != null) {
+                          conn.doOutput = true
+                          conn.setRequestProperty("Content-Type", "application/json")
+                          conn.outputStream.use { it.write(body.toString().toByteArray()) }
+                      }
+                      val code = conn.responseCode
+                      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                      val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+                      if (code !in 200..299) throw Exception("HTTP $code: ${text.take(100)}")
+                      return text
+                  } finally {
+                      conn.disconnect()
+                  }
+              }
+
+              private fun randomLetters(n: Int) = (1..n).map { ('a'..'z').random() }.joinToString("")
+
+              fun createInbox() {
+                  // Prefer an active public domain; the first API result is not always usable.
+                  val domains = JSONObject(request("GET", "/domains")).getJSONArray("hydra:member")
+                  val candidates = (0 until domains.length()).mapNotNull { i ->
+                      val item = domains.getJSONObject(i)
+                      val domain = item.optString("domain")
+                      if (domain.isNotBlank() && item.optBoolean("isActive", true) && !item.optBoolean("isPrivate", false)) domain else null
+                  }
+                  if (candidates.isEmpty()) throw Exception("Mail service has no active domains; try again later")
+                  var lastError: Exception? = null
+                  for (domain in candidates) {
+                      try {
+                          val addr = "u" + randomLetters(10) + "@" + domain
+                          val password = randomLetters(12) + "Aa1!"
+                          val creds = JSONObject().put("address", addr).put("password", password)
+                          request("POST", "/accounts", creds)
+                          token = JSONObject(request("POST", "/token", creds)).getString("token")
+                          seen.clear()
+                          address = addr
+                          return
+                      } catch (e: Exception) {
+                          lastError = e
+                      }
+                  }
+                  throw Exception("All mail domains failed: ${lastError?.message ?: "unknown API error"}")
+              }
+
+              /** Finds a likely OTP in subject, plain text, intro, or HTML of a new message. */
+              fun newCode(): String? {
+                  if (token.isEmpty()) return null
+                  val list = JSONObject(request("GET", "/messages", auth = true)).getJSONArray("hydra:member")
+                  var found: String? = null
+                  for (i in 0 until list.length()) {
+                      val m = list.getJSONObject(i)
+                      val id = m.optString("id")
+                      if (id.isBlank() || seen.contains(id)) continue
+                      val full = JSONObject(request("GET", "/messages/$id", auth = true))
+                      val html = full.optJSONArray("html")?.let { a -> (0 until a.length()).joinToString(" ") { a.optString(it) } } ?: ""
+                      val body = listOf(
+                          full.optString("subject"), full.optString("intro"), full.optString("text"), html
+                      ).joinToString(" ").replace(Regex("<[^>]*>"), " ")
+                          .replace("&nbsp;", " ").replace("&amp;", "&")
+                      // Prefer numbers near OTP/verification language, then fall back to 4–8 digits.
+                      val contextual = Regex("(?i)(?:verification|verify|security|one[- ]time|otp|code|passcode)[^0-9]{0,35}([0-9]{4,8})").find(body)?.groupValues?.get(1)
+                      val match = contextual ?: Regex("\\b[0-9]{4,8}\\b").find(body)?.value
+                      seen.add(id)
+                      if (found == null && match != null) found = match
+                  }
+                  return found
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p 'app/src/main/java/com/example/tempmail'
+          cat > 'app/src/main/java/com/example/tempmail/MainActivity.kt' <<'__END_OF_FILE__'
+          package com.example.tempmail
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad, pad, pad)
+
+                  val info = TextView(this)
+                  info.text = "TempMail Bubble\n\nA floating bubble that gives you a disposable email and shows verification codes on top of any browser or app."
+                  info.textSize = 15f
+                  root.addView(info)
+
+                  fun add(label: String, action: () -> Unit) {
+                      val b = Button(this)
+                      b.text = label
+                      b.isAllCaps = false
+                      b.setOnClickListener { action() }
+                      root.addView(b)
+                  }
+
+                  add("1. Allow display over other apps") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+                  add("2. (Optional) Turn on auto-fill") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  add("3. Start the bubble") { startBubble() }
+                  add("Stop the bubble") { stopService(Intent(this, BubbleService::class.java)) }
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(root)
+                  setContentView(scroll)
+              }
+
+              private fun startBubble() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Allow display over other apps first (step 1)", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  startForegroundService(Intent(this, BubbleService::class.java))
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p 'app/src/main/res/values'
+          cat > 'app/src/main/res/values/strings.xml' <<'__END_OF_FILE__'
+          <resources>
+              <string name="app_name">TempMail Bubble</string>
+              <string name="a11y_desc">Lets the TempMail bubble type your temporary email and verification code into the text field you are using. It does not read or store anything.</string>
+          </resources>
+          __END_OF_FILE__
+          mkdir -p 'app/src/main/res/xml'
+          cat > 'app/src/main/res/xml/accessibility_config.xml' <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeViewFocused"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/a11y_desc"
+              android:notificationTimeout="100" />
+          __END_OF_FILE__
+          cat > 'build.gradle.kts' <<'__END_OF_FILE__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __END_OF_FILE__
+          cat > 'gradle.properties' <<'__END_OF_FILE__'
+          android.useAndroidX=true
+          __END_OF_FILE__
+          cat > 'settings.gradle.kts' <<'__END_OF_FILE__'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "TempMail"
+          include(":app")
+          __END_OF_FILE__
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TempMail-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
